@@ -1,0 +1,345 @@
+{
+  "name": "Direct Docker PATH sources",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {},
+  "env": {
+    "PATH": "/synthetic/workflow-bin:/usr/local/bin:/usr/bin:/bin"
+  },
+  "jobs": {
+    "workflow-path": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 10,
+      "env": {
+        "SIBLING": "false"
+      },
+      "services": {
+        "cache": {
+          "image": "redis:7-alpine",
+          "options": "--health-cmd \"redis-cli ping\" --health-interval 1s --health-timeout 2s --health-retries 10"
+        }
+      },
+      "steps": [
+        {
+          "name": "Prepare files and parent controls",
+          "shell": "sh",
+          "run": "set -eu\nprintf workspace-marker > fixture.txt\nprintf temp-marker > \"$RUNNER_TEMP/proof.txt\"\nmkdir -p proof-bin\nprintf '#!/bin/sh\\nprintf tool-marker\\n' > proof-bin/direct-tool\nchmod 755 proof-bin/direct-tool\nprintf '%s\\n' \"$GITHUB_WORKSPACE/proof-bin\" /synthetic/added-bin >> \"$GITHUB_PATH\"\ncat > proof.py <<'PY'\nEXPECTED_ARGV = [['left', 'ab c', 'right'], ['left', 'ab right'], ['left', 'a\"b', 'c right'], ['left', 'a\"b', 'right'], ['left', 'a\\\\b c', 'right'], ['left', 'a\\\\b right'], ['left', 'a\\\\\"b', 'c right'], ['left', 'a\\\\\"b', 'right'], ['left', 'a\\\\\\\\b c', 'right'], ['left', 'a\\\\\\\\b right'], ['left', '\"', 'right'], ['left', 'ab', 'right'], ['left', 'a\"b', 'right'], ['left', 'a\"b right'], ['left', '', '', 'right'], ['left', 'pre\"post', 'right'], ['left', \"'two\", \"words'\", 'right'], ['$HOME', '${HOME}', '$(id)', '`id`', ';', '&&', '||', '|', '>', '<', '*', '?', '~']]\n\nimport json, os, pathlib, shutil, socket, sys\nmode = sys.argv[1]\nrecord = {\"mode\": mode, \"argv\": sys.argv[2:], \"home\": os.environ[\"HOME\"],\n          \"cwd\": os.getcwd(), \"uid\": os.getuid(), \"gid\": os.getgid(),\n          \"path\": os.environ[\"PATH\"], \"tool\": shutil.which(\"direct-tool\"),\n          \"docker_socket\": pathlib.Path(\"/var/run/docker.sock\").is_socket()}\nassert record[\"home\"] == \"/github/home\", record\nassert record[\"cwd\"] == \"/github/workspace\", record\nassert record[\"uid\"] == 0, record\nif mode.startswith(\"argv-\"):\n    assert record[\"argv\"] == EXPECTED_ARGV[int(mode[5:])], record\nelse:\n    aliases = {\"ALIAS_WS\": \"/github/workspace\", \"ALIAS_FILE\": \"/github/workspace/fixture.txt\",\n               \"ALIAS_TEMP\": \"/github/runner_temp\", \"ALIAS_TEMP_FILE\": \"/github/runner_temp/proof.txt\",\n               \"INPUT_DIRECTORY\": \"/github/workspace\", \"INPUT_FILE\": \"/github/workspace/fixture.txt\",\n               \"INPUT_TEMP\": \"/github/runner_temp\", \"INPUT_TEMP_FILE\": \"/github/runner_temp/proof.txt\"}\n    record[\"aliases\"] = {key: os.environ[key] for key in aliases}\n    assert record[\"aliases\"] == aliases, record\n    for key in (\"ALIAS_FILE\", \"INPUT_FILE\"):\n        assert pathlib.Path(os.environ[key]).read_text() == \"workspace-marker\", record\n    for key in (\"ALIAS_TEMP_FILE\", \"INPUT_TEMP_FILE\"):\n        assert pathlib.Path(os.environ[key]).read_text() == \"temp-marker\", record\n    original = os.environ[\"ORIGINAL_WORKSPACE\"][len(\"prefix:\"):]\n    assert os.environ[\"EMBEDDED\"] == \"prefix:\" + original + \"/fixture.txt\", record\n    assert os.environ[\"NEAR_PREFIX\"] == original + \"-suffix\", record\n    assert os.environ[\"INPUT_MIXED-KEY\"] == \"two words\", record\n    assert os.environ[\"INPUT_EMPTY\"] == \"\", record\n    assert os.environ[\"INPUT_WHITESPACE\"] == \"   \", record\n    expected_path = os.environ[\"EXPECTED_PATH\"]\n    if mode == \"nonleading\":\n        expected_path = \"/usr/local/bin:\" + original + \"/proof-bin:/usr/bin:/bin\"\n    assert record[\"path\"] == expected_path, record\n    if mode == \"step-path\":\n        assert record[\"tool\"] == \"/github/workspace/proof-bin/direct-tool\", record\n    else:\n        assert record[\"tool\"] is None, record\n    home = pathlib.Path(os.environ[\"HOME\"]) / \"direct-home-marker\"\n    if mode == \"first\":\n        assert not home.exists(), record\n        if os.environ[\"SIBLING\"] == \"true\":\n            assert pathlib.Path(\"/github/home/parent-home-marker\").read_text() == \"parent-marker\", record\n        home.write_text(\"shared-marker\")\n        with socket.create_connection((\"cache\", 6379), timeout=5) as service:\n            service.sendall(b\"PING\\r\\n\")\n            assert service.recv(64) == b\"+PONG\\r\\n\", record\n        with open(os.environ[\"GITHUB_OUTPUT\"], \"a\") as out:\n            out.write(\"result=direct-proof\\n\")\n        with open(os.environ[\"GITHUB_ENV\"], \"a\") as out:\n            out.write(\"DIRECT_ENV=visible\\n\")\n        with open(os.environ[\"GITHUB_PATH\"], \"a\") as out:\n            out.write(\"/synthetic/action-added\\n\")\n        with open(os.environ[\"GITHUB_STEP_SUMMARY\"], \"a\") as out:\n            out.write(\"direct Docker proof summary\\n\")\n        print(\"::add-mask::synthetic-direct-proof-canary\")\n        print(\"synthetic-direct-proof-canary\")\n    else:\n        assert home.read_text() == \"shared-marker\", record\nprint(\"DIRECT_DOCKER_RECORD=\" + json.dumps(record, sort_keys=True))\n\nPY\ncat > empty.sh <<'SH'\n#!/bin/sh\nset -eu\ntest \"$#\" -eq 0\nprintf 'DIRECT_DOCKER_DEFAULT=entrypoint-clears-CMD\\n'\nSH\ncat > nonroot.sh <<'SH'\nset -eu\ntest \"$(id -u)\" = 101\ntest \"$(id -g)\" = 101\ntest \"$HOME\" = /github/home\ntest \"$(cat \"$HOME/direct-home-marker\")\" = shared-marker\nprintf 'DIRECT_DOCKER_USER={\"uid\":101,\"gid\":101,\"home\":\"/github/home\"}\\n'\nSH\nchmod 755 empty.sh\n"
+        },
+        {
+          "name": "first",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/workflow-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py first",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          },
+          "id": "first"
+        },
+        {
+          "name": "shared-home",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/workflow-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py shared-home",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "step-path",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/github/workspace/proof-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix",
+            "PATH": "${{ github.workspace }}/proof-bin:/usr/local/bin:/usr/bin:/bin"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py step-path",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "nonleading",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "unused",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix",
+            "PATH": "/usr/local/bin:${{ github.workspace }}/proof-bin:/usr/bin:/bin"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py nonleading",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "Write PATH after prepends",
+          "shell": "sh",
+          "run": "echo PATH=/synthetic/github-env-bin:/usr/local/bin:/usr/bin:/bin >> \"$GITHUB_ENV\""
+        },
+        {
+          "name": "file-path",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/github-env-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py file-path",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "Verify parent file commands",
+          "shell": "sh",
+          "env": {
+            "RESULT": "${{ steps.first.outputs.result }}"
+          },
+          "run": "set -eu\ntest \"$DIRECT_ENV\" = visible\ntest \"$RESULT\" = direct-proof\ntest \"$(command -v direct-tool)\" = \"$GITHUB_WORKSPACE/proof-bin/direct-tool\"\nprintf 'DIRECT_DOCKER_PARENT={\"outputs\":\"passed\",\"env\":\"passed\",\"path\":\"passed\"}\\n'\n"
+        }
+      ]
+    },
+    "job-path": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 10,
+      "env": {
+        "SIBLING": "false",
+        "PATH": "/synthetic/job-bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "services": {
+        "cache": {
+          "image": "redis:7-alpine",
+          "options": "--health-cmd \"redis-cli ping\" --health-interval 1s --health-timeout 2s --health-retries 10"
+        }
+      },
+      "steps": [
+        {
+          "name": "Prepare files and parent controls",
+          "shell": "sh",
+          "run": "set -eu\nprintf workspace-marker > fixture.txt\nprintf temp-marker > \"$RUNNER_TEMP/proof.txt\"\nmkdir -p proof-bin\nprintf '#!/bin/sh\\nprintf tool-marker\\n' > proof-bin/direct-tool\nchmod 755 proof-bin/direct-tool\nprintf '%s\\n' \"$GITHUB_WORKSPACE/proof-bin\" /synthetic/added-bin >> \"$GITHUB_PATH\"\ncat > proof.py <<'PY'\nEXPECTED_ARGV = [['left', 'ab c', 'right'], ['left', 'ab right'], ['left', 'a\"b', 'c right'], ['left', 'a\"b', 'right'], ['left', 'a\\\\b c', 'right'], ['left', 'a\\\\b right'], ['left', 'a\\\\\"b', 'c right'], ['left', 'a\\\\\"b', 'right'], ['left', 'a\\\\\\\\b c', 'right'], ['left', 'a\\\\\\\\b right'], ['left', '\"', 'right'], ['left', 'ab', 'right'], ['left', 'a\"b', 'right'], ['left', 'a\"b right'], ['left', '', '', 'right'], ['left', 'pre\"post', 'right'], ['left', \"'two\", \"words'\", 'right'], ['$HOME', '${HOME}', '$(id)', '`id`', ';', '&&', '||', '|', '>', '<', '*', '?', '~']]\n\nimport json, os, pathlib, shutil, socket, sys\nmode = sys.argv[1]\nrecord = {\"mode\": mode, \"argv\": sys.argv[2:], \"home\": os.environ[\"HOME\"],\n          \"cwd\": os.getcwd(), \"uid\": os.getuid(), \"gid\": os.getgid(),\n          \"path\": os.environ[\"PATH\"], \"tool\": shutil.which(\"direct-tool\"),\n          \"docker_socket\": pathlib.Path(\"/var/run/docker.sock\").is_socket()}\nassert record[\"home\"] == \"/github/home\", record\nassert record[\"cwd\"] == \"/github/workspace\", record\nassert record[\"uid\"] == 0, record\nif mode.startswith(\"argv-\"):\n    assert record[\"argv\"] == EXPECTED_ARGV[int(mode[5:])], record\nelse:\n    aliases = {\"ALIAS_WS\": \"/github/workspace\", \"ALIAS_FILE\": \"/github/workspace/fixture.txt\",\n               \"ALIAS_TEMP\": \"/github/runner_temp\", \"ALIAS_TEMP_FILE\": \"/github/runner_temp/proof.txt\",\n               \"INPUT_DIRECTORY\": \"/github/workspace\", \"INPUT_FILE\": \"/github/workspace/fixture.txt\",\n               \"INPUT_TEMP\": \"/github/runner_temp\", \"INPUT_TEMP_FILE\": \"/github/runner_temp/proof.txt\"}\n    record[\"aliases\"] = {key: os.environ[key] for key in aliases}\n    assert record[\"aliases\"] == aliases, record\n    for key in (\"ALIAS_FILE\", \"INPUT_FILE\"):\n        assert pathlib.Path(os.environ[key]).read_text() == \"workspace-marker\", record\n    for key in (\"ALIAS_TEMP_FILE\", \"INPUT_TEMP_FILE\"):\n        assert pathlib.Path(os.environ[key]).read_text() == \"temp-marker\", record\n    original = os.environ[\"ORIGINAL_WORKSPACE\"][len(\"prefix:\"):]\n    assert os.environ[\"EMBEDDED\"] == \"prefix:\" + original + \"/fixture.txt\", record\n    assert os.environ[\"NEAR_PREFIX\"] == original + \"-suffix\", record\n    assert os.environ[\"INPUT_MIXED-KEY\"] == \"two words\", record\n    assert os.environ[\"INPUT_EMPTY\"] == \"\", record\n    assert os.environ[\"INPUT_WHITESPACE\"] == \"   \", record\n    expected_path = os.environ[\"EXPECTED_PATH\"]\n    if mode == \"nonleading\":\n        expected_path = \"/usr/local/bin:\" + original + \"/proof-bin:/usr/bin:/bin\"\n    assert record[\"path\"] == expected_path, record\n    if mode == \"step-path\":\n        assert record[\"tool\"] == \"/github/workspace/proof-bin/direct-tool\", record\n    else:\n        assert record[\"tool\"] is None, record\n    home = pathlib.Path(os.environ[\"HOME\"]) / \"direct-home-marker\"\n    if mode == \"first\":\n        assert not home.exists(), record\n        if os.environ[\"SIBLING\"] == \"true\":\n            assert pathlib.Path(\"/github/home/parent-home-marker\").read_text() == \"parent-marker\", record\n        home.write_text(\"shared-marker\")\n        with socket.create_connection((\"cache\", 6379), timeout=5) as service:\n            service.sendall(b\"PING\\r\\n\")\n            assert service.recv(64) == b\"+PONG\\r\\n\", record\n        with open(os.environ[\"GITHUB_OUTPUT\"], \"a\") as out:\n            out.write(\"result=direct-proof\\n\")\n        with open(os.environ[\"GITHUB_ENV\"], \"a\") as out:\n            out.write(\"DIRECT_ENV=visible\\n\")\n        with open(os.environ[\"GITHUB_PATH\"], \"a\") as out:\n            out.write(\"/synthetic/action-added\\n\")\n        with open(os.environ[\"GITHUB_STEP_SUMMARY\"], \"a\") as out:\n            out.write(\"direct Docker proof summary\\n\")\n        print(\"::add-mask::synthetic-direct-proof-canary\")\n        print(\"synthetic-direct-proof-canary\")\n    else:\n        assert home.read_text() == \"shared-marker\", record\nprint(\"DIRECT_DOCKER_RECORD=\" + json.dumps(record, sort_keys=True))\n\nPY\ncat > empty.sh <<'SH'\n#!/bin/sh\nset -eu\ntest \"$#\" -eq 0\nprintf 'DIRECT_DOCKER_DEFAULT=entrypoint-clears-CMD\\n'\nSH\ncat > nonroot.sh <<'SH'\nset -eu\ntest \"$(id -u)\" = 101\ntest \"$(id -g)\" = 101\ntest \"$HOME\" = /github/home\ntest \"$(cat \"$HOME/direct-home-marker\")\" = shared-marker\nprintf 'DIRECT_DOCKER_USER={\"uid\":101,\"gid\":101,\"home\":\"/github/home\"}\\n'\nSH\nchmod 755 empty.sh\n"
+        },
+        {
+          "name": "first",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/job-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py first",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          },
+          "id": "first"
+        },
+        {
+          "name": "shared-home",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/job-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py shared-home",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "step-path",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/github/workspace/proof-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix",
+            "PATH": "${{ github.workspace }}/proof-bin:/usr/local/bin:/usr/bin:/bin"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py step-path",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "nonleading",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "unused",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix",
+            "PATH": "/usr/local/bin:${{ github.workspace }}/proof-bin:/usr/bin:/bin"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py nonleading",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "Write PATH after prepends",
+          "shell": "sh",
+          "run": "echo PATH=/synthetic/github-env-bin:/usr/local/bin:/usr/bin:/bin >> \"$GITHUB_ENV\""
+        },
+        {
+          "name": "file-path",
+          "uses": "docker://python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+          "env": {
+            "HOME": "/synthetic/caller-home",
+            "EXPECTED_PATH": "/synthetic/github-env-bin:/usr/local/bin:/usr/bin:/bin",
+            "ALIAS_WS": "${{ github.workspace }}",
+            "ALIAS_FILE": "${{ github.workspace }}/fixture.txt",
+            "ALIAS_TEMP": "${{ runner.temp }}",
+            "ALIAS_TEMP_FILE": "${{ runner.temp }}/proof.txt",
+            "ORIGINAL_WORKSPACE": "prefix:${{ github.workspace }}",
+            "EMBEDDED": "prefix:${{ github.workspace }}/fixture.txt",
+            "NEAR_PREFIX": "${{ github.workspace }}-suffix"
+          },
+          "with": {
+            "entrypoint": "/usr/local/bin/python3",
+            "args": "proof.py file-path",
+            "directory": "${{ github.workspace }}",
+            "file": "${{ github.workspace }}/fixture.txt",
+            "temp": "${{ runner.temp }}",
+            "temp_file": "${{ runner.temp }}/proof.txt",
+            "MiXeD-Key": "two words",
+            "empty": "",
+            "whitespace": "   "
+          }
+        },
+        {
+          "name": "Verify parent file commands",
+          "shell": "sh",
+          "env": {
+            "RESULT": "${{ steps.first.outputs.result }}"
+          },
+          "run": "set -eu\ntest \"$DIRECT_ENV\" = visible\ntest \"$RESULT\" = direct-proof\ntest \"$(command -v direct-tool)\" = \"$GITHUB_WORKSPACE/proof-bin/direct-tool\"\nprintf 'DIRECT_DOCKER_PARENT={\"outputs\":\"passed\",\"env\":\"passed\",\"path\":\"passed\"}\\n'\n"
+        }
+      ]
+    }
+  }
+}
